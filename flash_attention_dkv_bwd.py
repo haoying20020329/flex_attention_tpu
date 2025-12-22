@@ -3,6 +3,7 @@ import functools
 from typing import Callable
 
 import jax
+import jax.experimental.pallas
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax import random
@@ -206,6 +207,7 @@ def flash_attention_dkv_kernel(
       mask_fn,
       block_mask_fn
   ):
+    jax.experimental.pallas.debug_print("nothing")
 
     _, _, q_seq_length, _ = q_tile_ref.shape
     # Grid: (Batch, Head, Major_K, Major_Q)
@@ -221,11 +223,15 @@ def flash_attention_dkv_kernel(
         dv_scratch_ref[:, :] = jnp.zeros(dv_scratch_ref.shape, dv_scratch_ref.dtype)
 
     # --- BLOCK MASK CHECK (OUTER) ---
+    # jax.debug.print("checkpointing")
+    # jax.experimental.pallas.debug_print("kv {}, q {}",kv_tile_idx.astype(jnp.int32), q_tile_idx.astype(jnp.int32))
+    
     if block_mask_fn is None:
       should_run = True
     else:
       # We check once for the entire Major Q / Major K block pair
       should_run = block_mask_fn(q_tile_idx, kv_tile_idx)
+
       
     @pl.when(should_run)
     def body():
@@ -309,120 +315,6 @@ def flash_attention_dkv_kernel(
     # return flash_attention_dkv_kernel
 
 
-# def mha_reference_bwd(
-#     q, 
-#     k,
-#     v, 
-#     ab,
-#     segment_ids: None,
-#     o,
-#     l,
-#     m,
-#     do,
-#     causal: bool = False,
-#     mask_value: float = None,
-#     *,
-#     sm_scale: float = 1.0, 
-# ):
-#   if mask_value is None:
-#       mask_value = -1e9
-
-#   logits = jnp.einsum(
-#       "bhqc,bhkc->bhqk",
-#       q.astype(jnp.float32),
-#       k.astype(jnp.float32),
-#   )
-
-#   if sm_scale != 1.0:
-#     logits *= sm_scale
-
-#   if ab is not None:
-#     logits += ab
-
-#   mask = None
-#   if segment_ids is not None:
-#     mask = segment_ids.q[:, :, None] == segment_ids.kv[:, None, :]
-#     mask = mask[:, None, :, :]
-
-#   if causal:
-#     _, _, q_seq_len, _ = q.shape
-#     _, _, kv_seq_len, _ = k.shape
-#     mask_shape = (q_seq_len, kv_seq_len)
-#     row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
-#     col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
-#     causal_mask = (col_ids <= row_ids)[None, None, :, :]
-#     mask = causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
-
-#   logits = logits if mask is None else logits + jnp.where(mask, 0.0, mask_value)
-#   # jax.debug.print("logits norm: {x:.3e}", x=jnp.linalg.norm(logits))
-#   # jax.debug.print("logits - m norm: {x:.3e}", x=jnp.linalg.norm(logits - m[..., None]))
-#   # jax.debug.print("mnorm: {x:.3e}", x=jnp.linalg.norm(m))
-#   unnormalized = jnp.exp(logits - m[..., None])
-#   # jax.debug.print("exp norm: {x:.3e}", x=jnp.linalg.norm(unnormalized))
-#   p = unnormalized / l[..., None]
-#   # jax.debug.print("p norm: {x:.3e}", x=jnp.linalg.norm(p))
-
-#   dv = jnp.einsum("bhpt,bhpd->bhtd", p, do.astype(jnp.float32)).astype(v.dtype)
-
-#   dp = jnp.einsum(
-#       "bhpd,bhtd->bhpt", do.astype(jnp.float32), v.astype(jnp.float32)
-#   )
-#   # jax.debug.print("dp norm: {x:.3e}", x=jnp.linalg.norm(dp))
-
-#   di = jnp.sum(o.astype(jnp.float32) * do.astype(jnp.float32), axis=-1)[
-#       ..., None
-#   ]  # [batch_size, num_heads, q_seq_len]
-
-#   ds = (dp - di) * p
-#   # jax.debug.print("ds norm before scale: {x:.3e}", x=jnp.linalg.norm(ds))
-#   ds = ds * sm_scale
-#   # Requires: import jax
-#   # jax.debug.print("ds norm: {x:.3e}", x=jnp.linalg.norm(ds))
-
-#   dk = jnp.einsum("bhsd,bhst->bhtd", q.astype(jnp.float32), ds).astype(k.dtype)
-#   dq = jnp.einsum("bhst,bhtd->bhsd", ds, k.astype(jnp.float32)).astype(q.dtype)
-
-#   # dab is just ds
-#   dab = ds if ab is not None else None
-
-#   return dq, dk, dv, dab
-
-
-# def _mha_reference_bwd(
-#     q,
-#     k,
-#     v,
-#     ab,
-#     o,
-#     l,
-#     m,
-#     do,
-#     *,
-#     segment_ids, 
-#     causal: bool,
-#     mask_value: float,
-#     sm_scale: float,
-#     save_residuals: bool,
-    
-# ):
-#   # del save_residuals
-#   # q, k, v, ab, segment_ids, o, l, m = residuals
-#   dq, dk, dv, dab = mha_bwd_reference(
-#       q,
-#       k,
-#       v,
-#       ab,
-#       segment_ids,
-#       o,
-#       l,
-#       m,
-#       do,
-#       causal=causal,
-#       mask_value=mask_value,
-#       sm_scale=sm_scale,
-#   )
-#   return dq, dk, dv, dab, None
-
 def flop_count_attention(b, h, q, k, d):
     """
     Rough FLOP count for one forward pass of scaled dot-product attention:
@@ -433,7 +325,7 @@ def flop_count_attention(b, h, q, k, d):
     """
     return 4.0 * b * h * q * k * d
 
-def benchmark(fn, args, iters=30, warmup=5, name="fn"):
+def benchmark(fn, args, iters=1, warmup=1, name="fn"):
     # 1. Warmup phase — triggers JIT compilation and stabilizes cache
     for _ in range(warmup):
         y = fn(*args)
@@ -444,6 +336,7 @@ def benchmark(fn, args, iters=30, warmup=5, name="fn"):
             )
         else:
             y.block_until_ready()
+        jax.effects_barrier()
 
     # 2. Timed runs
     times = []
@@ -457,6 +350,7 @@ def benchmark(fn, args, iters=30, warmup=5, name="fn"):
             )
         else:
             y.block_until_ready()
+        jax.effects_barrier()
         t1 = time.perf_counter()
         times.append(t1 - t0)
 
@@ -621,6 +515,7 @@ def run_bench_suite(
     dk_flex, dv_flex = flex_jit(q, k, v, l, m, di, do)
     dk_flex = dk_flex.block_until_ready()
     dv_flex = dv_flex.block_until_ready()
+    jax.effects_barrier()
 
     rel_err_dk = jnp.linalg.norm(dk_flex - dk_ref) / (jnp.linalg.norm(dk_ref) + 1e-6)
     rel_err_dv = jnp.linalg.norm(dv_flex - dv_ref) / (jnp.linalg.norm(dv_ref) + 1e-6)
@@ -639,111 +534,9 @@ def run_bench_suite(
         "rel_l2_dk": rel_err_dk_f,
         "rel_l2_dv": rel_err_dv_f,
     }
+    
 
 
-
-# def main():
-#   key = jax.random.PRNGKey(0)
-#   batch = 1
-#   heads = 1
-#   q_len = 20480 # Reduced for quick testing, increase to 12800 for real bench
-#   kv_len = 20480
-#   head_dim = 128
-
-#   k1, k2, k3, k4 = jax.random.split(key, 4)
-#   q = jax.random.normal(k1, (batch, heads, q_len, head_dim), dtype=jnp.float32)
-#   k = jax.random.normal(k2, (batch, heads, kv_len, head_dim), dtype=jnp.float32)
-#   v = jax.random.normal(k3, (batch, heads, kv_len, head_dim), dtype=jnp.float32)
-#   do = jax.random.normal(k4, (batch, heads, q_len, head_dim), dtype=jnp.float32)
-#   ab = None
-#   segment_ids = None
-
-#   block_b = 1
-#   block_q_major = 1024
-#   block_q = 1024
-#   block_k_major = 1024
-#   block_k = 1024
-
-#   causal = False # Example: Enable Causal
-#   sm_scale = 1.0
-#   debug = False
-#   save_residuals = True
-
-#   # --- Define Custom Mask Functions ---
-#   # Example: Causal Mask Logic
-#   def causal_mask_fn(q_idx, k_idx):
-#       return q_idx[:,None] >= k_idx[None,:] # True means "Mask out" (drop), False means keep
-  
-#   def causal_block_mask_fn(q_block_idx, k_block_idx):
-#       # Calculate global token indices for the blocks
-#       # q_start = q_block_idx * block_q # If using fine-grained
-#       # k_start = k_block_idx * block_k
-      
-#       # Using Major blocks:
-#       q_end_token = (q_block_idx + 1) * block_q_major - 1
-#       k_start_token = k_block_idx * block_k_major
-      
-#       # If the start of the K block is strictly after the end of the Q block,
-#       # the entire block is masked (future).
-#       return k_start_token <= q_end_token # Return TRUE if we SHOULD run
-
-#   # If causal=True is passed to kernels, they often have built-in logic.
-#   # But here we pass explicit functions to test the new plumbing.
-#   mask_fn_to_use = causal_mask_fn if causal else None
-#   block_mask_fn_to_use = causal_block_mask_fn if causal else None
-
-
-#   print("Running Pallas TPU flash attention kernel (Forward Setup)...")
-  
-#   # Note: _mha_reference generally handles 'causal' arg internally. 
-#   o_ref, l_ref, m_ref = mha_reference(
-#       q=q, k=k, v=v,sm_scale=sm_scale,
-#       save_residuals=save_residuals,
-#       causal=causal # Ensure reference knows it is causal
-#   )
-
-#   o, l, m = _flex_attention_impl(
-#       q=q, k=k, v=v, ab=ab, segment_ids=segment_ids,
-#       save_residuals=save_residuals,
-#       causal=causal, sm_scale=sm_scale,
-#       block_b=block_b, block_q=block_q_major,
-#       block_k_major=block_k_major, block_k=block_k,
-#       debug=debug, score_fn=None,
-#       mask_fn=mask_fn_to_use,            # Passed
-#       block_mask_fn=block_mask_fn_to_use # Passed
-#   )
-
-#   print(f"o diff: {jnp.linalg.norm(o_ref - o)/jnp.linalg.norm(o_ref):.3e}")
-#   print(f"l diff: {jnp.linalg.norm(l_ref - l)/jnp.linalg.norm(l_ref):.3e}")
-#   print(f"m diff: {jnp.linalg.norm(m_ref - m)/(jnp.linalg.norm(m_ref) + 1e-6):.3e}")
-
-#   di = jnp.sum(o.astype(jnp.float32) * do.astype(jnp.float32), axis=-1)
-
-#   # --- Benchmark ---
-#   def my_score(q, k):
-#     logits = jnp.dot(q, k.T)
-#     return 30 * jnp.tanh(logits / 30)
-  
-#   jax_score = make_jax_score_fn(my_score)
-
-#   results = run_bench_suite(
-#       k=k, v=v, q=q, l=l, m=m, di=di, do=do, o=o, ab=ab, segment_ids=segment_ids,
-#       sm_scale=sm_scale,
-#       block_b=block_b,
-#       block_q=block_q,
-#       block_k_major=block_k_major,
-#       block_q_major=block_q_major,
-#       block_k=block_k,
-#       causal=causal,
-#       score_fn=jax_score,
-#       mask_fn=None,            # Passed
-#       block_mask_fn=None # Passed
-#   )
-
-#   print("\nSummary:", results)
-
-# if __name__ == "__main__":
-#   main()
 def generate_doc_lengths(total_len, num_docs, seed=0):
     """
     Generates a list of random document lengths that sum exactly to total_len.
@@ -803,15 +596,15 @@ def main():
     # -------------------------
     test_cases = []
 
-    test_cases.append({
-        "name": "Causal Attention",
-        "factory": masks.make_causal_mask_fns,
-        "factory_args": (),   # no extra args
-        "ref_args": {"causal": True},
-    })
+    # test_cases.append({
+    #     "name": "Causal Attention",
+    #     "factory": masks.make_causal_mask_fns,
+    #     "factory_args": (),   # no extra args
+    #     "ref_args": {"causal": True},
+    # })
 
     # --- Case B: Sliding Window ---
-    window_size = 1024
+    window_size = 2048
     test_cases.append({
         "name": f"Sliding Window (W={window_size})",
         "factory": masks.make_sliding_window_mask_fns,
@@ -819,55 +612,55 @@ def main():
         "ref_args": {"causal": False, "window_size": window_size},
     })
 
-    # --- Case C: Jagged Documents (Randomized) ---
-    doc_lengths = generate_doc_lengths(total_len=q_len, num_docs=5, seed=42)
-    print(f"Generated Doc Lengths: {doc_lengths}")
+    # # --- Case C: Jagged Documents (Randomized) ---
+    # doc_lengths = generate_doc_lengths(total_len=q_len, num_docs=5, seed=42)
+    # print(f"Generated Doc Lengths: {doc_lengths}")
 
-    # Build segment IDs for the reference (shape [B, L])
-    ref_ids_list = []
-    for i, length in enumerate(doc_lengths):
-        ref_ids_list.append(jnp.full((length,), i, dtype=jnp.int32))
-    jagged_ids_ref = jnp.concatenate(ref_ids_list)
-    jagged_ids_ref = jnp.tile(jagged_ids_ref[None, :], (batch, 1))
+    # # Build segment IDs for the reference (shape [B, L])
+    # ref_ids_list = []
+    # for i, length in enumerate(doc_lengths):
+    #     ref_ids_list.append(jnp.full((length,), i, dtype=jnp.int32))
+    # jagged_ids_ref = jnp.concatenate(ref_ids_list)
+    # jagged_ids_ref = jnp.tile(jagged_ids_ref[None, :], (batch, 1))
 
-    test_cases.append({
-        "name": f"Jagged Masking ({len(doc_lengths)} Docs)",
-        "factory": masks.make_jagged_mask_fns,
-        "factory_args": (doc_lengths,),
-        "ref_args": {
-            "causal": True,
-            "segment_ids": jagged_ids_ref,
-        },
-    })
+    # test_cases.append({
+    #     "name": f"Jagged Masking ({len(doc_lengths)} Docs)",
+    #     "factory": masks.make_jagged_mask_fns,
+    #     "factory_args": (doc_lengths,),
+    #     "ref_args": {
+    #         "causal": True,
+    #         "segment_ids": jagged_ids_ref,
+    #     },
+    # })
 
     # --- Case D: ALiBi (Score Function) ---
-    alibi_fn = make_jax_score_fn(
-        scores.make_alibi_score_fn(slope=0.5)
-    )
-    test_cases.append({
-        "name": "ALiBi Attention",
-        "factory": lambda *args: (None, None),  # no masks: score_fn only
-        "factory_args": (),
-        "ref_args": {
-            "score_fn": alibi_fn,
-            "alibi_slope": 0.5,
-            "causal": False,
-        },
-    })
+    # alibi_fn = make_jax_score_fn(
+    #     scores.make_alibi_score_fn(slope=0.5)
+    # )
+    # test_cases.append({
+    #     "name": "ALiBi Attention",
+    #     "factory": lambda *args: (None, None),  # no masks: score_fn only
+    #     "factory_args": (),
+    #     "ref_args": {
+    #         "score_fn": alibi_fn,
+    #         "alibi_slope": 0.5,
+    #         "causal": False,
+    #     },
+    # })
 
     # --- Case E: Tanh Soft-Capping (Score Function) ---
-    tanh_fn = make_jax_score_fn(
-        scores.make_softcap_score_fn(cap=30.0)
-    )
-    test_cases.append({
-        "name": "Tanh Soft-Capping",
-        "factory": lambda *args: (None, None),
-        "factory_args": (),
-        "ref_args": {
-            "score_fn": tanh_fn,
-            "causal": False,
-        },
-    })
+    # tanh_fn = make_jax_score_fn(
+    #     scores.make_softcap_score_fn(cap=30.0)
+    # )
+    # test_cases.append({
+    #     "name": "Tanh Soft-Capping",
+    #     "factory": lambda *args: (None, None),
+    #     "factory_args": (),
+    #     "ref_args": {
+    #         "score_fn": tanh_fn,
+    #         "causal": False,
+    #     },
+    # })
 
     # (If you later want causal / sliding / jagged, you can reuse the same
     # factories & ref_args pattern from the dq main and just extend test_cases.)

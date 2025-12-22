@@ -25,9 +25,6 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
-from jax import random
-from flash_attention_fwd_ref import _flash_attention_impl_ref
-from flex_attention_kernel import _flex_attention_impl
 
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 NUM_LANES = 128
@@ -1719,55 +1716,3 @@ def _verify_block(block_name, dim_name, block, dim, should_divide=True):
     )
 
 
-def main():
-  key = random.PRNGKey(0)
-  batch = 1
-  heads = 1
-  q_len = 1024
-  kv_len = 25600
-  head_dim = 128
-
-  k1, k2, k3, k4 = random.split(key, 4)
-  q = random.normal(k1, (batch, heads, q_len, head_dim), dtype=jnp.float32)
-  k = random.normal(k2, (batch, heads, kv_len, head_dim), dtype=jnp.float32)
-  v = random.normal(k3, (batch, heads, kv_len, head_dim), dtype=jnp.float32)
-  do = random.normal(k4, (batch, heads, q_len, head_dim), dtype=jnp.float32)
-  ab = None
-  segment_ids = None
-
-  block_b = 1
-  block_q_major = 1024
-  block_q = 128
-  block_k_major = 1024
-  block_k = 128
-
-  causal = False
-  sm_scale = float(1.0 / jnp.sqrt(head_dim).astype(jnp.float32))
-  debug = False
-  save_residuals = True
-
-
-  print("Running Pallas TPU flash attention kernel...")
-  o_ref, l_ref, m_ref = _mha_reference_fwd (
-      q=q, k=k, v=v, ab= ab,segment_ids=segment_ids,mask_value=DEFAULT_MASK_VALUE,sm_scale=sm_scale,
-      save_residuals=False,causal=causal
-  )
-
-  o, l, m = _flex_attention_impl(
-      q=q, k=k, v=v, ab=ab, segment_ids=segment_ids,
-      save_residuals=save_residuals,
-      causal=causal, sm_scale=sm_scale,
-      block_b=block_b, block_q=block_q_major,
-      block_k_major=block_k_major, block_k=block_k,
-      debug=debug,score_fn=None
-  )
-
-  print(f"o diff: {jnp.linalg.norm(o_ref - o)/jnp.linalg.norm(o_ref):.3e}")
-  print(f"l diff: {jnp.linalg.norm(l_ref - l)/jnp.linalg.norm(l_ref):.3e}")
-  print(f"m diff: {jnp.linalg.norm(m_ref - m)//jnp.linalg.norm(m_ref):.3e}")
-
-
-
-
-if __name__ == "__main__":
-  main()
