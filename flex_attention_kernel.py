@@ -91,6 +91,9 @@ def _flex_attention_impl(
   batch_size, num_heads, q_seq_len, head_dim = q.shape
   _, _, kv_seq_len, _ = k.shape
 
+  # kernel launch instances to partition computations
+  # q tile fixed, stream kv tiles
+  # generate grid indices
   grid = (
       pl.cdiv(batch_size, block_b),
       num_heads,
@@ -98,6 +101,8 @@ def _flex_attention_impl(
       kv_seq_len // block_k_major,
   )
 
+  # Use grid indices to determine the exact coordinates to start data load/store
+  # input index map
   def q_index_map(batch_index, head_index, q_seq_index, _):
     return (batch_index, head_index, q_seq_index, 0)
 
@@ -117,30 +122,29 @@ def _flex_attention_impl(
     next_kv_index = kv_seq_index
     return (batch_index, head_index, next_q_index, next_kv_index)
 
+  # output index map
   def o_index_map(batch_index, head_index, q_seq_index, _):
     return (batch_index, head_index, q_seq_index, 0)
 
   def lm_index_map(batch_index, head_index, q_seq_index, _):
     return (batch_index, head_index, q_seq_index, 0)
 
+  # input specs
+  ab_block_spec = (
+      pl.BlockSpec((block_b, 1, block_q, block_k_major), ab_index_map)
+      if ab is not None else None)
 
+  in_specs = [
+      pl.BlockSpec((block_b, 1, block_q, head_dim), q_index_map),
+      pl.BlockSpec((block_b, 1, block_k_major, head_dim), kv_index_map),
+      pl.BlockSpec((block_b, 1, block_k_major, head_dim), kv_index_map),
+      ab_block_spec,
+  ]
 
-  kernel = functools.partial(
-      _flash_attention_kernel,
-      causal=causal,
-      sm_scale=sm_scale,
-      block_k=block_k,
-      kv_seq_len=kv_seq_len,
-      score_jaxpr=score_fn,
-      block_mask_fn=block_mask_fn,
-      mask_fn=mask_fn
-  )
-
-
-  out_shape = jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
-  out_shape = [out_shape]
-  out_specs = [pl.BlockSpec((block_b, 1, block_q, head_dim), o_index_map)]
-
+  # scratches
+  # scratches save intermediate result to be accumulated
+  # l, m and. o are intermediate matrices updated over kv tile loops
+  # Theoretically, there should not be kv dismension, we expand it to min_block for alignment 
   if block_k != kv_seq_len:
     m_scratch = pltpu.VMEM((block_b, 1, block_q, MIN_BLOCK_SIZE), jnp.float32)
     l_scratch = pltpu.VMEM((block_b, 1, block_q, MIN_BLOCK_SIZE), jnp.float32)
@@ -149,11 +153,16 @@ def _flex_attention_impl(
   else:
     scratch_shapes = []
 
+  # output specs
+  out_shape = jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
+  out_shape = [out_shape]
+  out_specs = [pl.BlockSpec((block_b, 1, block_q, head_dim), o_index_map)]
+
   if save_residuals:
     out_specs = [
         *out_specs,
         pl.BlockSpec((block_b, 1, block_q, MIN_BLOCK_SIZE), lm_index_map),
-        pl.BlockSpec((block_b, 1, block_q, MIN_BLOCK_SIZE), lm_index_map),
+        pl.BlockSpec((block_b, 1, block_q, MIN_sBLOCK_SIZE), lm_index_map),
     ]
     l = jax.ShapeDtypeStruct(
         (batch_size, num_heads, q_seq_len, MIN_BLOCK_SIZE), dtype=jnp.float32
@@ -166,17 +175,19 @@ def _flex_attention_impl(
     out_specs = [*out_specs, None, None]
     out_shape = (*out_shape, None, None)
 
-  ab_block_spec = (
-      pl.BlockSpec((block_b, 1, block_q, block_k_major), ab_index_map)
-      if ab is not None else None)
+  # prefill parameters
+  kernel = functools.partial(
+    _flash_attention_kernel,
+    causal=causal,
+    sm_scale=sm_scale,
+    block_k=block_k,
+    kv_seq_len=kv_seq_len,
+    score_jaxpr=score_fn,
+    block_mask_fn=block_mask_fn,
+    mask_fn=mask_fn
+  )
 
-  in_specs = [
-      pl.BlockSpec((block_b, 1, block_q, head_dim), q_index_map),
-      pl.BlockSpec((block_b, 1, block_k_major, head_dim), kv_index_map),
-      pl.BlockSpec((block_b, 1, block_k_major, head_dim), kv_index_map),
-      ab_block_spec,
-  ]
-
+  # Create a xla custom tpu kernel
   o, *aux = pl.pallas_call(
       kernel,
       grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -244,6 +255,9 @@ def make_flash_attention_kernel(mask_fn=None, block_mask_fn=None, score_jaxpr=No
     def body():
       @pl.loop(0, block_k_major, step=block_k, unroll=True)
       def _body(start_k):
+
+        # q_block fixed and loop over kv tiles(exploit tpu efficiency in large matmul)
+        # without reloading q more multiple times, increase tpu utilization
         m_past = m_scratch_ref[batch_idx]
         l_past = l_scratch_ref[batch_idx]
         O_past = O_scratch_ref[batch_idx]
