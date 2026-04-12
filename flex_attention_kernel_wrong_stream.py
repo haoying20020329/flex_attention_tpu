@@ -228,12 +228,12 @@ def make_flash_attention_kernel(mask_fn=None, block_mask_fn=None, score_jaxpr=No
       *,
       causal,
       sm_scale,
-      block_k,
+      block_q,
       kv_seq_len,
   ):
-    block_k_major = k_tile_ref.shape[2]
+    block_q_major = q_tile_ref.shape[2]
     head_dim = k_tile_ref.shape[3]
-    block_q = q_tile_ref.shape[2]
+    block_k = k_tile_ref.shape[2]
     kv_seq_idx = pl.program_id(3)
     q_seq_idx = pl.program_id(2)   
 
@@ -254,18 +254,18 @@ def make_flash_attention_kernel(mask_fn=None, block_mask_fn=None, score_jaxpr=No
 
     @pl.when(should_run)
     def body():
-      @pl.loop(0, block_k_major // block_k, unroll=True)
+      @pl.loop(0, block_q_major // block_q, unroll=True)
       def _body(i):
 
-        start_k = i * block_k
+        start_q = i * block_q
 
         # q_block fixed and loop over kv tiles(exploit tpu efficiency in large matmul)
         # without reloading q more multiple times, increase tpu utilization
         m_past = m_scratch_ref[batch_idx]
         l_past = l_scratch_ref[batch_idx]
         O_past = O_scratch_ref[batch_idx]
-        k_ref = k_tile_ref[(*batch_idx, pl.dslice(start_k, block_k), slice(None))]
-        q_ref = q_tile_ref[batch_idx]
+        q_ref = q_tile_ref[(*batch_idx, pl.dslice(start_q, block_q), slice(None))]
+        k_ref = k_tile_ref[batch_idx]
         block_q = q_ref.shape[0]
         
     # ============================================================
@@ -347,7 +347,7 @@ def make_flash_attention_kernel(mask_fn=None, block_mask_fn=None, score_jaxpr=No
         l_next_inv_safe = jnp.where(l_next == 0.0, 1.0, 1.0 / l_next)
         v_ref = v_tile_ref[(*batch_idx, pl.dslice(start_k, block_k), slice(None))]
         o_curr = jax.lax.dot(
-            P, v_ref.astype(jnp.float32),
+            P.astype(v_ref.dtype), v_ref,
             preferred_element_type=jnp.float32
         )
         O_scratch_ref[batch_idx] = O_past * l_broadcast(l_corr) + o_curr
@@ -678,7 +678,7 @@ def main():
     # Block Sizes (Must match what fits in your VMEM)
     block_q = 1024
     block_k_major = 1024
-    block_k = 128
+    block_k = 1024
 
     # 2. Generate Inputs (BF16 for TPU Speed)
     # -------------------------
@@ -697,9 +697,9 @@ def main():
     # --- Case A: Standard Causal ---
     test_cases.append({
         "name": "Causal Attention",
-        "factory": masks.make_causal_mask_fns,
-        "factory_args": (),
-        "ref_args": {"causal": True}
+        "factory": masks.place_holder,
+        "factory_args": (), # No extra args needed for causal factory
+        "ref_args": {"causal": False}
     })
 
     # # --- Case B: Sliding Window ---

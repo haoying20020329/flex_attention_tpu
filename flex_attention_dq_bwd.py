@@ -320,10 +320,12 @@ def flex_attention_bwd_dq_kernel(
     else:
       should_run = block_mask_fn(q_tile_idx, kv_tile_idx)
     
+    # fix q and stream over kv blocks because we are doing accumulation over each q block
     @pl.when(should_run)
     def body():
-        @pl.loop(0, block_k_major, step=block_k, unroll=True)
-        def _body(start_kv):
+        @pl.loop(0, block_k_major // block_k, unroll=True)
+        def _body(j):
+            start_kv = j * block_k
 
             q = q_tile_ref[batch_idx]
             k = k_tile_ref[(*batch_idx, pl.dslice(start_kv, block_k), slice(None))]
@@ -609,7 +611,7 @@ def run_bench_suite(
 import jax
 import jax.numpy as jnp
 from jax import random
-import pandas as pd
+# import pandas as pd
 
 # --- TPU v5e Specs (Approximate) ---
 TPU_PEAK_TFLOPS = 197.0

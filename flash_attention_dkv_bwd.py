@@ -17,7 +17,6 @@ from mha_reference import mha_reference,mha_bwd_reference
 from util import make_jax_score_fn
 import scores
 import masks
-import pandas as pd
 
 dimension_numbers = (((1,), (1,)), ((), ()))
 MIN_BLOCK_SIZE = 128
@@ -232,7 +231,7 @@ def flash_attention_dkv_kernel(
       # We check once for the entire Major Q / Major K block pair
       should_run = block_mask_fn(q_tile_idx, kv_tile_idx)
 
-      
+    # fix kv and stream over q blocks because we are doing accumulation over each kv block
     @pl.when(should_run)
     def body():
       @pl.loop(0, block_q_major // block_q, unroll=True)
